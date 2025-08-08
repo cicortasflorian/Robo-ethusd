@@ -1,33 +1,18 @@
-# main.py — ROBO1 (ETH/USD) with cross-under BUY & cross-over SELL
-# - Reads config from ./env (simple KEY=VALUE file). Render can override via Environment Variables.
-# - Signals:
-#     BUY  when RSI crosses DOWN through BUY_CROSS_LEVEL (e.g., from >28 to <=28), spread <= MAX_SPREAD_PERCENT
-#     SELL when RSI crosses UP   through SELL_CROSS_LEVEL (e.g., from <72 to >=72) with NET profit >= MIN_NET_PROFIT_PERCENT
-#     TP   when price gain >= +5% and net profit >= min
-#     SL   when price loss <= -2% (safety stop)
-# - Cooldown: after a BUY, for the next 2 hours a second BUY is allowed only if price is at least 0.5% lower than last buy.
-# - Max 3 buys / trading day (UTC). For crypto, day is 00:00–23:59 UTC.
-# - Heartbeat log every minute with current RSI/price/spread & active config.
-#
-# NOTE: This is a reference implementation. Make sure your Capital.com API plan allows the endpoints used.
-#       Endpoints may differ by account/region; adjust get_candles/get_quote if necessary.
+# ROBO1 – ETH/USD (sau ce SYMBOL pui în env) – cross-under BUY / cross-over SELL
+# + jurnalizare detaliată în log (Render Live tail)
 
 import time
 import requests
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 
-# ---------- load config from ./env ----------
 def load_env():
     cfg = {}
     try:
         with open("env","r") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line or line.startswith("#"): 
-                    continue
-                if "=" in line:
-                    k,v = line.split("=",1)
+            for line in f:
+                if "=" in line and not line.strip().startswith("#"):
+                    k,v = line.strip().split("=",1)
                     cfg[k.strip()] = v.strip()
     except FileNotFoundError:
         pass
@@ -35,25 +20,30 @@ def load_env():
 
 CFG = load_env()
 
-API_KEY = CFG.get("API_KEY","")
-SYMBOL = CFG.get("SYMBOL","ETHUSD")  # no slash for Capital endpoints
-TIMEFRAME = CFG.get("TIMEFRAME","10m")
-RSI_PERIOD = int(CFG.get("RSI_PERIOD", 3))
-INVEST_AMOUNT = float(CFG.get("INVEST_AMOUNT", 10))
-MAX_SPREAD = float(CFG.get("MAX_SPREAD_PERCENT", 0.7))
-MIN_NET_PROFIT = float(CFG.get("MIN_NET_PROFIT_PERCENT", 0.5))
-BUY_CROSS_LEVEL = float(CFG.get("BUY_CROSS_LEVEL", 28))
-SELL_CROSS_LEVEL = float(CFG.get("SELL_CROSS_LEVEL", 72))
-TELEGRAM_TOKEN = CFG.get("TELEGRAM_TOKEN","")
-TELEGRAM_CHAT_ID = CFG.get("TELEGRAM_CHAT_ID","")
+API_KEY            = CFG.get("API_KEY","")
+SYMBOL             = CFG.get("SYMBOL","ETHUSD")        # ETHUSD / SEDG etc. fără slash
+TIMEFRAME          = CFG.get("TIMEFRAME","90m")        # ex: 10m, 90m, 2h
+RSI_PERIOD         = int(CFG.get("RSI_PERIOD",14))
+INVEST_AMOUNT      = float(CFG.get("INVEST_AMOUNT",10))
+MAX_SPREAD         = float(CFG.get("MAX_SPREAD_PERCENT",0.7))
+MIN_NET_PROFIT     = float(CFG.get("MIN_NET_PROFIT_PERCENT",0.5))
+BUY_CROSS_LEVEL    = float(CFG.get("BUY_CROSS_LEVEL",28))
+SELL_CROSS_LEVEL   = float(CFG.get("SELL_CROSS_LEVEL",72))
+TELEGRAM_TOKEN     = CFG.get("TELEGRAM_TOKEN","")
+TELEGRAM_CHAT_ID   = CFG.get("TELEGRAM_CHAT_ID","")
 
-# ---------- bot state (in-memory) ----------
+# ---- stare bot ----
 prev_rsi = None
-pozitie_deschisa = None
+pozitie_deschisa = None   # {"pret": float, "ora": datetime}
 ultima_cumparare = None
 tranzactii_azi = 0
 cumparari_azi = []
-capital = 0.0  # evidență locală (NU banilor reali)
+capital = 0.0  # evidență locală
+
+def log(msg):
+    # print cu timestamp UTC, forțăm flush ca să apară imediat în Live tail
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"[ROBO1] {ts} | {msg}", flush=True)
 
 def headers():
     return {"X-CAP-API-KEY": API_KEY, "Accept":"application/json"}
@@ -64,26 +54,26 @@ def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"Telegram FAIL: {e}")
 
 def get_candles(limit=300):
-    # NOTE: Endpoint/shape can vary. Adjust if your account returns a different JSON schema.
     url = f"https://api-capital.backend-capital.com/candles/{SYMBOL}?resolution={TIMEFRAME}&limit={limit}"
     r = requests.get(url, headers=headers(), timeout=15)
     r.raise_for_status()
     data = r.json()
-    candles = data.get("candles", data)
+    candles = data['candles'] if 'candles' in data else data
     df = pd.DataFrame(candles)
-    # normalize close column
-    for k in ['close','c','Close','CLOSE','midClose']:
+
+    # normalizează coloana close
+    for k in ['close','c','Close','CLOSE','midClose','price']:
         if k in df.columns:
-            df['close'] = pd.to_numeric(df[k], errors='coerce')
+            df['close'] = pd.to_numeric(df[k], errors="coerce")
             break
     if 'close' not in df.columns:
         raise ValueError("Nu găsesc coloana close în răspunsul de la API.")
-    df = df.dropna(subset=['close']).reset_index(drop=True)
-    return df
+
+    return df.dropna(subset=['close'])
 
 def calc_rsi(series, period):
     delta = series.diff()
@@ -92,133 +82,128 @@ def calc_rsi(series, period):
     avg_gain = gain.rolling(period, min_periods=period).mean()
     avg_loss = loss.rolling(period, min_periods=period).mean()
     rs = avg_gain / avg_loss.replace(0,1e-9)
-    rsi = 100 - (100/(1+rs))
-    return rsi
+    return 100 - (100/(1+rs))
 
 def get_quote():
-    # NOTE: Endpoint/shape can vary.
     url = f"https://api-capital.backend-capital.com/pricing/{SYMBOL}"
     r = requests.get(url, headers=headers(), timeout=10)
     r.raise_for_status()
     data = r.json()
-    # Attempt multiple field names for compatibility
-    ask = None; bid = None
-    if isinstance(data, dict) and 'price' in data:
-        p = data['price']
-        ask = p.get('ask') or p.get('offer') or p.get('askPrice')
-        bid = p.get('bid') or p.get('bidPrice')
-    if ask is None: ask = data.get('ask')
-    if bid is None: bid = data.get('bid')
-    ask = float(ask)
-    bid = float(bid)
+    # încercăm câmpuri comune
+    ask = None
+    bid = None
+
+    if isinstance(data, dict):
+        p = data.get('price', data)
+        for k in ('ask','offer','askPrice'):
+            if k in p:
+                ask = float(p[k]); break
+        for k in ('bid','bidPrice'):
+            if k in p:
+                bid = float(p[k]); break
+    if ask is None or bid is None:
+        raise ValueError(f"Quote invalid pentru {SYMBOL}: {data}")
     return ask, bid
 
-def pct_spread(ask,bid):
-    if not bid:
-        return 999.0
-    return ((ask-bid)/bid)*100.0
-
-def day_reset_needed(now_utc, tz_hour=0):
-    # Resetează la 00:00 UTC (în primele 5 minute) — suficient pentru crypto.
-    return (now_utc.hour == tz_hour and now_utc.minute < 5)
-
-def log_heartbeat(cur_rsi, ask, bid, spread):
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{now}] HB | SYMBOL={SYMBOL} TIMEFRAME={TIMEFRAME} RSI_P={RSI_PERIOD} "
-          f"BUY_LVL={BUY_CROSS_LEVEL} SELL_LVL={SELL_CROSS_LEVEL} "
-          f"ASK={ask:.6f} BID={bid:.6f} SPREAD%={spread:.3f} RSI={cur_rsi:.2f}")
-    # flush pentru Render
-    try:
-        import sys; sys.stdout.flush()
-    except Exception:
-        pass
+def pct_spread(ask, bid):
+    return ((ask - bid) / bid) * 100 if bid else 999.0
 
 def tick():
     global prev_rsi, pozitie_deschisa, ultima_cumparare, tranzactii_azi, cumparari_azi, capital
+
     now = datetime.now(timezone.utc)
 
-    df = get_candles(limit=max(200, RSI_PERIOD*5))
+    # reset zilnic (UTC)
+    if now.hour == 0 and now.minute < 3 and tranzactii_azi > 0:
+        log(f"Reset contor zilnic: tranzactii_azi={tranzactii_azi}")
+        tranzactii_azi = 0
+        cumparari_azi = []
+
+    # date & RSI
+    df = get_candles(limit=max(200, RSI_PERIOD * 5))
     rsi_series = calc_rsi(df['close'], RSI_PERIOD)
     cur_rsi = float(rsi_series.iloc[-1])
 
     ask, bid = get_quote()
     spread = pct_spread(ask, bid)
 
-    # heartbeat
-    log_heartbeat(cur_rsi, ask, bid, spread)
+    log(f"Tick | SYMBOL={SYMBOL} TF={TIMEFRAME} RSI={cur_rsi:.2f} (prev={prev_rsi:.2f} if prev else None) "
+        f"| ask={ask:.5f} bid={bid:.5f} spread={spread:.3f}% "
+        f"| pozitie={'DA' if pozitie_deschisa else 'NU'} tranzactii_azi={tranzactii_azi}")
 
-    # reset zilnic
-    if day_reset_needed(now) and tranzactii_azi > 0:
-        tranzactii_azi = 0
-        cumparari_azi = []
-
-    # semnale
-    crossed_down_buy = crossed_up_sell = False
+    crossed_down_buy = False
+    crossed_up_sell = False
     if prev_rsi is not None:
         crossed_down_buy = (prev_rsi > BUY_CROSS_LEVEL) and (cur_rsi <= BUY_CROSS_LEVEL)
         crossed_up_sell  = (prev_rsi < SELL_CROSS_LEVEL) and (cur_rsi >= SELL_CROSS_LEVEL)
+        if crossed_down_buy:
+            log(f"Semnal BUY: RSI a trecut în jos sub {BUY_CROSS_LEVEL} (prev={prev_rsi:.2f} -> cur={cur_rsi:.2f})")
+        if crossed_up_sell:
+            log(f"Semnal SELL: RSI a trecut în sus peste {SELL_CROSS_LEVEL} (prev={prev_rsi:.2f} -> cur={cur_rsi:.2f})")
 
-    # SELL management
+    # === SELL management ===
     if pozitie_deschisa:
         entry = pozitie_deschisa['pret']
-        delta_pct = ((bid - entry)/entry)*100.0
+        delta_pct = ((bid - entry) / entry) * 100
         net_profit = delta_pct - spread
 
-        if delta_pct >= 5.0 and net_profit >= MIN_NET_PROFIT:
-            print(f"→ SELL TAKE +5% | entry={entry:.6f} bid={bid:.6f} net={net_profit:.2f}% RSI={cur_rsi:.2f}")
-            send_telegram(f"[ROBO1] SELL TAKE +5% | net={net_profit:.2f}% | RSI={cur_rsi:.2f}")
-            pozitie_deschisa = None
-            capital += INVEST_AMOUNT*(1+net_profit/100.0)
+        log(f"Pozitie deschisa | entry={entry:.5f} PnL={delta_pct:.2f}% net={net_profit:.2f}% (după spread)")
 
-        elif delta_pct <= -2.0:
-            print(f"→ SELL STOP -2% | entry={entry:.6f} bid={bid:.6f} pnl={delta_pct:.2f}% RSI={cur_rsi:.2f}")
-            send_telegram(f"[ROBO1] SELL STOP -2% | pnl={delta_pct:.2f}% | RSI={cur_rsi:.2f}")
+        if delta_pct >= 5 and net_profit >= MIN_NET_PROFIT:
+            log(f"SELL TAKE +5% | net={net_profit:.2f}% | RSI={cur_rsi:.2f}")
+            send_telegram(f"[ROBO1] SELL TAKE +5% | RSI={cur_rsi:.2f} | net={net_profit:.2f}%")
             pozitie_deschisa = None
-            capital += INVEST_AMOUNT*(1+delta_pct/100.0)
-
+            capital += INVEST_AMOUNT * (1 + net_profit / 100)
+        elif delta_pct <= -2:
+            log(f"SELL STOP -2% | pnl={delta_pct:.2f}% | RSI={cur_rsi:.2f}")
+            send_telegram(f"[ROBO1] SELL STOP -2% | RSI={cur_rsi:.2f} | pnl={delta_pct:.2f}%")
+            pozitie_deschisa = None
+            capital += INVEST_AMOUNT * (1 + delta_pct / 100)
         elif crossed_up_sell and net_profit >= MIN_NET_PROFIT:
-            print(f"→ SELL RSI CROSS-UP {SELL_CROSS_LEVEL} | entry={entry:.6f} bid={bid:.6f} net={net_profit:.2f}%")
-            send_telegram(f"[ROBO1] SELL RSI CROSS-UP {SELL_CROSS_LEVEL} | net={net_profit:.2f}% | RSI={cur_rsi:.2f}")
+            log(f"SELL RSI CROSS-UP {SELL_CROSS_LEVEL} | net={net_profit:.2f}% | RSI={cur_rsi:.2f}")
+            send_telegram(f"[ROBO1] SELL RSI CROSS-UP {SELL_CROSS_LEVEL} | RSI={cur_rsi:.2f} | net={net_profit:.2f}%")
             pozitie_deschisa = None
-            capital += INVEST_AMOUNT*(1+net_profit/100.0)
+            capital += INVEST_AMOUNT * (1 + net_profit / 100)
 
-    # BUY
+    # === BUY logic ===
     else:
-        if tranzactii_azi < 3 and crossed_down_buy and spread <= MAX_SPREAD:
+        if not crossed_down_buy:
+            log("Nu cumpăr: nu s-a produs cross-down sub pragul BUY.")
+        elif spread > MAX_SPREAD:
+            log(f"Nu cumpăr: spread prea mare ({spread:.2f}% > {MAX_SPREAD}%).")
+        elif tranzactii_azi >= 3:
+            log("Nu cumpăr: limită zilnică de 3 intrări atinsă.")
+        else:
             ok_cooldown = (
                 (not ultima_cumparare) or
-                (now - ultima_cumparare > timedelta(hours=2)) or
-                (len(cumparari_azi)>0 and ask < cumparari_azi[-1]*0.995)  # -0.5%
+                (datetime.now(timezone.utc) - ultima_cumparare > timedelta(hours=2)) or
+                (len(cumparari_azi) > 0 and ask < cumparari_azi[-1] * 0.995)
             )
-            if ok_cooldown:
-                pozitie_deschisa = {"pret": ask, "ora": now}
-                ultima_cumparare = now
+            if not ok_cooldown:
+                log("Nu cumpăr: în cooldown (nu au trecut 2h și prețul nu e cu 0.5% mai jos decât ultima cumpărare).")
+            else:
+                pozitie_deschisa = {"pret": ask, "ora": datetime.now(timezone.utc)}
+                ultima_cumparare = datetime.now(timezone.utc)
                 cumparari_azi.append(ask)
                 tranzactii_azi += 1
                 capital -= INVEST_AMOUNT
-                print(f"→ BUY RSI CROSS-DOWN {BUY_CROSS_LEVEL} | ask={ask:.6f} spread%={spread:.3f} RSI={cur_rsi:.2f}")
-                send_telegram(f"[ROBO1] BUY RSI CROSS-DOWN {BUY_CROSS_LEVEL} | price={ask:.6f} | spread={spread:.2f}% | RSI={cur_rsi:.2f}")
+                log(f"BUY EXEC | price={ask:.5f} | spread={spread:.2f}% | RSI={cur_rsi:.2f} | tranzactii_azi={tranzactii_azi}")
+                send_telegram(f"[ROBO1] BUY RSI CROSS-DOWN {BUY_CROSS_LEVEL} | RSI={cur_rsi:.2f} | price={ask:.5f} | spread={spread:.2f}%")
 
     prev_rsi = cur_rsi
 
 def main():
-    print("ROBO1 started with configuration:")
-    print(f"  SYMBOL={SYMBOL} TIMEFRAME={TIMEFRAME} RSI_PERIOD={RSI_PERIOD} INVEST_AMOUNT={INVEST_AMOUNT}")
-    print(f"  BUY_CROSS_LEVEL={BUY_CROSS_LEVEL} SELL_CROSS_LEVEL={SELL_CROSS_LEVEL}")
-    print(f"  MAX_SPREAD%={MAX_SPREAD} MIN_NET_PROFIT%={MIN_NET_PROFIT}")
-    try:
-        import sys; sys.stdout.flush()
-    except Exception:
-        pass
-    send_telegram(f"[ROBO1] Pornit | {SYMBOL} {TIMEFRAME} | RSI_P={RSI_PERIOD}")
-
+    log("pornit (cross signals)")
+    log(f"Config: SYMBOL={SYMBOL} TIMEFRAME={TIMEFRAME} RSI_PERIOD={RSI_PERIOD} "
+        f"INVEST_AMOUNT={INVEST_AMOUNT} BUY_CROSS_LEVEL={BUY_CROSS_LEVEL} "
+        f"SELL_CROSS_LEVEL={SELL_CROSS_LEVEL} MAX_SPREAD%={MAX_SPREAD} MIN_NET_PROFIT%={MIN_NET_PROFIT}")
     while True:
         try:
             tick()
         except Exception as e:
-            print(f"[E] {e}")
+            log(f"Eroare: {e}")
             send_telegram(f"[ROBO1] Eroare: {e}")
-        time.sleep(60)  # o verificare pe minut
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()
