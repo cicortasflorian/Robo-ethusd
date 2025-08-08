@@ -1,79 +1,152 @@
-# ROBO1 – ETH/USD (sau ce SYMBOL pui în env) – cross-under BUY / cross-over SELL
-# + jurnalizare detaliată în log (Render Live tail)
-
-import time
-import requests
+# main.py — ROBO1 (Capital.com compat) : EPIC resolver + v1 prices
+import time, json, requests
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 
+# --------- Config din ./env ----------
 def load_env():
-    cfg = {}
+    cfg={}
     try:
         with open("env","r") as f:
             for line in f:
-                if "=" in line and not line.strip().startswith("#"):
-                    k,v = line.strip().split("=",1)
-                    cfg[k.strip()] = v.strip()
+                if "=" in line:
+                    k,v=line.strip().split("=",1); cfg[k]=v
     except FileNotFoundError:
         pass
     return cfg
 
 CFG = load_env()
 
-API_KEY            = CFG.get("API_KEY","")
-SYMBOL             = CFG.get("SYMBOL","ETHUSD")        # ETHUSD / SEDG etc. fără slash
-TIMEFRAME          = CFG.get("TIMEFRAME","90m")        # ex: 10m, 90m, 2h
-RSI_PERIOD         = int(CFG.get("RSI_PERIOD",14))
-INVEST_AMOUNT      = float(CFG.get("INVEST_AMOUNT",10))
-MAX_SPREAD         = float(CFG.get("MAX_SPREAD_PERCENT",0.7))
-MIN_NET_PROFIT     = float(CFG.get("MIN_NET_PROFIT_PERCENT",0.5))
-BUY_CROSS_LEVEL    = float(CFG.get("BUY_CROSS_LEVEL",28))
-SELL_CROSS_LEVEL   = float(CFG.get("SELL_CROSS_LEVEL",72))
-TELEGRAM_TOKEN     = CFG.get("TELEGRAM_TOKEN","")
-TELEGRAM_CHAT_ID   = CFG.get("TELEGRAM_CHAT_ID","")
+API_KEY        = CFG.get("API_KEY","")
+API_PASSWORD   = CFG.get("API_PASSWORD","")   # <— nou!
+SYMBOL         = CFG.get("SYMBOL","ETHUSD").replace("/","")
+TIMEFRAME      = CFG.get("TIMEFRAME","10m")
+RSI_PERIOD     = int(CFG.get("RSI_PERIOD",14))
+INVEST_AMOUNT  = float(CFG.get("INVEST_AMOUNT",10))
+MAX_SPREAD     = float(CFG.get("MAX_SPREAD_PERCENT",0.7))
+MIN_NET_PROFIT = float(CFG.get("MIN_NET_PROFIT_PERCENT",0.5))
+BUY_LVL        = float(CFG.get("BUY_CROSS_LEVEL",28))
+SELL_LVL       = float(CFG.get("SELL_CROSS_LEVEL",72))
+TG_TOKEN       = CFG.get("TELEGRAM_TOKEN","")
+TG_CHAT        = CFG.get("TELEGRAM_CHAT_ID","")
 
-# ---- stare bot ----
-prev_rsi = None
-pozitie_deschisa = None   # {"pret": float, "ora": datetime}
-ultima_cumparare = None
-tranzactii_azi = 0
-cumparari_azi = []
-capital = 0.0  # evidență locală
-
-def log(msg):
-    # print cu timestamp UTC, forțăm flush ca să apară imediat în Live tail
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[ROBO1] {ts} | {msg}", flush=True)
-
-def headers():
-    return {"X-CAP-API-KEY": API_KEY, "Accept":"application/json"}
+BASE = "https://api-capital.backend-capital.com"
+CST = None
+XSEC = None
+EPIC_CACHE = {}
 
 def send_telegram(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+    if not TG_TOKEN or not TG_CHAT: return
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
-    except Exception as e:
-        log(f"Telegram FAIL: {e}")
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data={"chat_id": TG_CHAT, "text": msg}, timeout=10
+        )
+    except: pass
 
-def get_candles(limit=300):
-    url = f"https://api-capital.backend-capital.com/candles/{SYMBOL}?resolution={TIMEFRAME}&limit={limit}"
-    r = requests.get(url, headers=headers(), timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    candles = data['candles'] if 'candles' in data else data
-    df = pd.DataFrame(candles)
+def api_headers(extra=None):
+    h = {
+        "X-CAP-API-KEY": API_KEY,
+        "Accept": "application/json"
+    }
+    if CST and XSEC:
+        h["CST"] = CST
+        h["X-SECURITY-TOKEN"] = XSEC
+    if extra: h.update(extra)
+    return h
 
-    # normalizează coloana close
-    for k in ['close','c','Close','CLOSE','midClose','price']:
-        if k in df.columns:
-            df['close'] = pd.to_numeric(df[k], errors="coerce")
-            break
-    if 'close' not in df.columns:
-        raise ValueError("Nu găsesc coloana close în răspunsul de la API.")
+def login_session():
+    """Obține CST & X-SECURITY-TOKEN pe baza API key + custom password."""
+    global CST, XSEC
+    # Capital.com (IG) cere POST /api/v1/session cu password
+    payload = {"identifier": API_KEY, "password": API_PASSWORD}
+    r = requests.post(f"{BASE}/api/v1/session", headers=api_headers(), json=payload, timeout=20)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Login failed: {r.status_code} {r.text}")
+    CST  = r.headers.get("CST")
+    XSEC = r.headers.get("X-SECURITY-TOKEN")
+    if not CST or not XSEC:
+        raise RuntimeError("Missing CST or X-SECURITY-TOKEN after login.")
 
-    return df.dropna(subset=['close'])
+def to_resolution(tf: str) -> str:
+    """Mapează 10m -> MINUTE_10, 1H -> HOUR, 1D -> DAY etc."""
+    t = tf.strip().lower()
+    if t.endswith("m"):
+        n=int(t[:-1]); return f"MINUTE_{n}" if n!=1 else "MINUTE"
+    if t.endswith("h"):
+        n=int(t[:-1]); return f"HOUR_{n}" if n!=1 else "HOUR"
+    if t.endswith("d"):
+        return "DAY"
+    return "MINUTE_10"
+
+def resolve_epic(symbol: str) -> str:
+    """Caută EPIC pentru simbol (probăm ambii parametri de căutare)."""
+    if symbol in EPIC_CACHE: return EPIC_CACHE[symbol]
+
+    for qparam in ("searchTerm", "search"):
+        try:
+            url = f"{BASE}/api/v1/markets?{qparam}={symbol}"
+            r = requests.get(url, headers=api_headers(), timeout=20)
+            if r.status_code >= 400: continue
+            js = r.json()
+            # încercăm câteva forme posibile ale răspunsului
+            items = js.get("markets") or js.get("instruments") or js
+            if isinstance(items, dict): items = items.get("markets") or items.get("instruments")
+            if not isinstance(items, list): continue
+            for it in items:
+                # epic poate sta sub 'epic' sau 'instrument' etc.
+                epic = it.get("epic") or it.get("EPIC") or it.get("instrument") or it.get("id")
+                sym  = (it.get("instrumentName") or it.get("symbol") or "").replace("/","")
+                if epic and (symbol.upper() in (sym.upper(), epic.upper())):
+                    EPIC_CACHE[symbol]=epic; return epic
+            # fallback: ia primul care pare corect
+            for it in items:
+                if "epic" in it:
+                    EPIC_CACHE[symbol]=it["epic"]; return it["epic"]
+        except Exception:
+            continue
+    raise RuntimeError(f"Nu am putut găsi EPIC pentru {symbol}")
+
+def get_prices(epic: str, resolution: str, max_n=200):
+    url = f"{BASE}/api/v1/prices/{epic}?resolution={resolution}&max={max_n}"
+    r = requests.get(url, headers=api_headers(), timeout=25); r.raise_for_status()
+    js = r.json()
+    # Capital/IG întoarce listă sub 'prices'; luăm 'closePrice' mid/bid/ask
+    rows = js.get("prices") or js
+    closes = []
+    for p in rows:
+        close = None
+        cp = p.get("closePrice") or {}
+        # prefer mid -> apoi bid/ask medie
+        if "mid" in cp and cp["mid"] is not None:
+            close = float(cp["mid"])
+        elif "bid" in cp and "ask" in cp and cp["bid"] is not None and cp["ask"] is not None:
+            close = (float(cp["bid"])+float(cp["ask"]))/2
+        elif "lastTraded" in p and p["lastTraded"] is not None:
+            close = float(p["lastTraded"])
+        if close is not None:
+            closes.append(close)
+    if not closes:
+        raise RuntimeError("N-am reușit să extrag close-urile din răspunsul de prețuri.")
+    return pd.Series(closes)
+
+def get_quote(epic: str):
+    # luăm ultima lumânare de 1min ca proxy pt ask/bid
+    url = f"{BASE}/api/v1/prices/{epic}?resolution=MINUTE&max=1"
+    r = requests.get(url, headers=api_headers(), timeout=15); r.raise_for_status()
+    js = r.json()
+    p = (js.get("prices") or [{}])[-1]
+    cp = p.get("closePrice") or {}
+    ask = cp.get("ask")
+    bid = cp.get("bid")
+    # dacă lipsesc, aproximăm din mid
+    mid = cp.get("mid")
+    if ask is None and bid is None and mid is not None:
+        ask = bid = float(mid)
+    return float(ask), float(bid)
+
+def pct_spread(ask,bid):
+    return ((ask-bid)/bid)*100 if bid else 999
 
 def calc_rsi(series, period):
     delta = series.diff()
@@ -84,125 +157,81 @@ def calc_rsi(series, period):
     rs = avg_gain / avg_loss.replace(0,1e-9)
     return 100 - (100/(1+rs))
 
-def get_quote():
-    url = f"https://api-capital.backend-capital.com/pricing/{SYMBOL}"
-    r = requests.get(url, headers=headers(), timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    # încercăm câmpuri comune
-    ask = None
-    bid = None
+# --------- Stare bot ----------
+prev_rsi = None
+pozitie = None
+ultima_buy = None
+tranzactii_azi = 0
+cumparari_azi=[]
+capital_local = 0.0
 
-    if isinstance(data, dict):
-        p = data.get('price', data)
-        for k in ('ask','offer','askPrice'):
-            if k in p:
-                ask = float(p[k]); break
-        for k in ('bid','bidPrice'):
-            if k in p:
-                bid = float(p[k]); break
-    if ask is None or bid is None:
-        raise ValueError(f"Quote invalid pentru {SYMBOL}: {data}")
-    return ask, bid
-
-def pct_spread(ask, bid):
-    return ((ask - bid) / bid) * 100 if bid else 999.0
-
-def tick():
-    global prev_rsi, pozitie_deschisa, ultima_cumparare, tranzactii_azi, cumparari_azi, capital
-
+def tick(epic, res_code):
+    global prev_rsi, pozitie, ultima_buy, tranzactii_azi, cumparari_azi, capital_local
     now = datetime.now(timezone.utc)
 
-    # reset zilnic (UTC)
-    if now.hour == 0 and now.minute < 3 and tranzactii_azi > 0:
-        log(f"Reset contor zilnic: tranzactii_azi={tranzactii_azi}")
-        tranzactii_azi = 0
-        cumparari_azi = []
-
-    # date & RSI
-    df = get_candles(limit=max(200, RSI_PERIOD * 5))
-    rsi_series = calc_rsi(df['close'], RSI_PERIOD)
+    closes = get_prices(epic, res_code, max_n=max(200,RSI_PERIOD*5))
+    rsi_series = calc_rsi(pd.Series(closes), RSI_PERIOD)
     cur_rsi = float(rsi_series.iloc[-1])
 
-    ask, bid = get_quote()
-    spread = pct_spread(ask, bid)
+    ask,bid = get_quote(epic)
+    spread = pct_spread(ask,bid)
 
-    log(f"Tick | SYMBOL={SYMBOL} TF={TIMEFRAME} RSI={cur_rsi:.2f} (prev={prev_rsi:.2f} if prev else None) "
-        f"| ask={ask:.5f} bid={bid:.5f} spread={spread:.3f}% "
-        f"| pozitie={'DA' if pozitie_deschisa else 'NU'} tranzactii_azi={tranzactii_azi}")
+    # reset simplu daily UTC
+    if now.hour == 0 and now.minute < 5 and tranzactii_azi>0:
+        tranzactii_azi = 0; cumparari_azi = []
 
-    crossed_down_buy = False
-    crossed_up_sell = False
-    if prev_rsi is not None:
-        crossed_down_buy = (prev_rsi > BUY_CROSS_LEVEL) and (cur_rsi <= BUY_CROSS_LEVEL)
-        crossed_up_sell  = (prev_rsi < SELL_CROSS_LEVEL) and (cur_rsi >= SELL_CROSS_LEVEL)
-        if crossed_down_buy:
-            log(f"Semnal BUY: RSI a trecut în jos sub {BUY_CROSS_LEVEL} (prev={prev_rsi:.2f} -> cur={cur_rsi:.2f})")
-        if crossed_up_sell:
-            log(f"Semnal SELL: RSI a trecut în sus peste {SELL_CROSS_LEVEL} (prev={prev_rsi:.2f} -> cur={cur_rsi:.2f})")
+    crossed_down_buy = prev_rsi is not None and (prev_rsi > BUY_LVL) and (cur_rsi <= BUY_LVL)
+    crossed_up_sell  = prev_rsi is not None and (prev_rsi < SELL_LVL) and (cur_rsi >= SELL_LVL)
 
-    # === SELL management ===
-    if pozitie_deschisa:
-        entry = pozitie_deschisa['pret']
-        delta_pct = ((bid - entry) / entry) * 100
+    # SELL
+    if pozitie:
+        entry = pozitie['pret']
+        delta_pct = ((bid - entry)/entry)*100
         net_profit = delta_pct - spread
-
-        log(f"Pozitie deschisa | entry={entry:.5f} PnL={delta_pct:.2f}% net={net_profit:.2f}% (după spread)")
-
         if delta_pct >= 5 and net_profit >= MIN_NET_PROFIT:
-            log(f"SELL TAKE +5% | net={net_profit:.2f}% | RSI={cur_rsi:.2f}")
             send_telegram(f"[ROBO1] SELL TAKE +5% | RSI={cur_rsi:.2f} | net={net_profit:.2f}%")
-            pozitie_deschisa = None
-            capital += INVEST_AMOUNT * (1 + net_profit / 100)
+            pozitie=None; capital_local += INVEST_AMOUNT*(1+net_profit/100)
         elif delta_pct <= -2:
-            log(f"SELL STOP -2% | pnl={delta_pct:.2f}% | RSI={cur_rsi:.2f}")
             send_telegram(f"[ROBO1] SELL STOP -2% | RSI={cur_rsi:.2f} | pnl={delta_pct:.2f}%")
-            pozitie_deschisa = None
-            capital += INVEST_AMOUNT * (1 + delta_pct / 100)
+            pozitie=None; capital_local += INVEST_AMOUNT*(1+delta_pct/100)
         elif crossed_up_sell and net_profit >= MIN_NET_PROFIT:
-            log(f"SELL RSI CROSS-UP {SELL_CROSS_LEVEL} | net={net_profit:.2f}% | RSI={cur_rsi:.2f}")
-            send_telegram(f"[ROBO1] SELL RSI CROSS-UP {SELL_CROSS_LEVEL} | RSI={cur_rsi:.2f} | net={net_profit:.2f}%")
-            pozitie_deschisa = None
-            capital += INVEST_AMOUNT * (1 + net_profit / 100)
-
-    # === BUY logic ===
+            send_telegram(f"[ROBO1] SELL RSI CROSS-UP {SELL_LVL} | RSI={cur_rsi:.2f} | net={net_profit:.2f}%")
+            pozitie=None; capital_local += INVEST_AMOUNT*(1+net_profit/100)
+    # BUY
     else:
-        if not crossed_down_buy:
-            log("Nu cumpăr: nu s-a produs cross-down sub pragul BUY.")
-        elif spread > MAX_SPREAD:
-            log(f"Nu cumpăr: spread prea mare ({spread:.2f}% > {MAX_SPREAD}%).")
-        elif tranzactii_azi >= 3:
-            log("Nu cumpăr: limită zilnică de 3 intrări atinsă.")
-        else:
-            ok_cooldown = (
-                (not ultima_cumparare) or
-                (datetime.now(timezone.utc) - ultima_cumparare > timedelta(hours=2)) or
-                (len(cumparari_azi) > 0 and ask < cumparari_azi[-1] * 0.995)
-            )
-            if not ok_cooldown:
-                log("Nu cumpăr: în cooldown (nu au trecut 2h și prețul nu e cu 0.5% mai jos decât ultima cumpărare).")
-            else:
-                pozitie_deschisa = {"pret": ask, "ora": datetime.now(timezone.utc)}
-                ultima_cumparare = datetime.now(timezone.utc)
+        if tranzactii_azi < 3 and crossed_down_buy and spread <= MAX_SPREAD:
+            ok_cd = (not ultima_buy) or (now - ultima_buy > timedelta(hours=2)) \
+                    or (len(cumparari_azi)>0 and ask < cumparari_azi[-1]*0.995)
+            if ok_cd:
+                pozitie={"pret":ask,"ora":now}
+                ultima_buy=now
                 cumparari_azi.append(ask)
                 tranzactii_azi += 1
-                capital -= INVEST_AMOUNT
-                log(f"BUY EXEC | price={ask:.5f} | spread={spread:.2f}% | RSI={cur_rsi:.2f} | tranzactii_azi={tranzactii_azi}")
-                send_telegram(f"[ROBO1] BUY RSI CROSS-DOWN {BUY_CROSS_LEVEL} | RSI={cur_rsi:.2f} | price={ask:.5f} | spread={spread:.2f}%")
+                capital_local -= INVEST_AMOUNT
+                send_telegram(f"[ROBO1] BUY RSI CROSS-DOWN {BUY_LVL} | RSI={cur_rsi:.2f} | price={ask:.2f} | spread={spread:.2f}%")
 
     prev_rsi = cur_rsi
 
 def main():
-    log("pornit (cross signals)")
-    log(f"Config: SYMBOL={SYMBOL} TIMEFRAME={TIMEFRAME} RSI_PERIOD={RSI_PERIOD} "
-        f"INVEST_AMOUNT={INVEST_AMOUNT} BUY_CROSS_LEVEL={BUY_CROSS_LEVEL} "
-        f"SELL_CROSS_LEVEL={SELL_CROSS_LEVEL} MAX_SPREAD%={MAX_SPREAD} MIN_NET_PROFIT%={MIN_NET_PROFIT}")
+    send_telegram("[ROBO1] pornit (compat v1 + EPIC)")
+    # 1) Login pt token-ele necesare
+    login_session()
+    # 2) Rezolvăm EPIC-ul
+    epic = resolve_epic(SYMBOL.upper())
+    # 3) Mapăm timeframe la rezoluția API
+    res = to_resolution(TIMEFRAME)
+    send_telegram(f"[ROBO1] Config: SYMBOL={SYMBOL} EPIC={epic} RES={res} RSI={RSI_PERIOD} "
+                  f"BUY={BUY_LVL} SELL={SELL_LVL} MAX_SPREAD%={MAX_SPREAD} MIN_NET_PROFIT%={MIN_NET_PROFIT}")
     while True:
         try:
-            tick()
+            tick(epic, res)
         except Exception as e:
-            log(f"Eroare: {e}")
             send_telegram(f"[ROBO1] Eroare: {e}")
+            # dacă token-urile expiră, încercăm relogin rapid
+            try:
+                login_session()
+            except Exception as ee:
+                send_telegram(f"[ROBO1] Relogin fail: {ee}")
         time.sleep(60)
 
 if __name__ == "__main__":
