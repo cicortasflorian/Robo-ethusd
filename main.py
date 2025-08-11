@@ -57,6 +57,42 @@ EPIC_CACHE = {}
 # ---------- login ----------
 def login_session():
     """
+    # --- căutare simboluri după text ---
+def search_symbols(query: str, limit: int = 100):
+    """
+    Caută instrumente care conțin 'query' în simbol sau nume și le afișează.
+    """
+    url = f"{BASE}/api/v1/instruments?query={query}&limit={limit}"
+    headers = {
+        "Content-Type": "application/json",
+        "X-CAP-API-KEY": API_KEY,
+        "CST": CST,
+        "X-SECURITY-TOKEN": XSEC,
+    }
+    r = requests.get(url, headers=headers, timeout=30)
+    if r.status_code != 200:
+        dbg(f"search_symbols('{query}') failed: {r.status_code} {r.text}")
+        return []
+
+    data = r.json() or {}
+    items = data.get("instruments") or data.get("results") or []
+    if not items:
+        info(f"Nu am găsit nimic pentru query='{query}'")
+        return []
+
+    info(f"Am găsit {len(items)} rezultate pentru '{query}':")
+    found = []
+    for it in items:
+        epic   = it.get("epic") or it.get("id") or ""
+        symbol = it.get("symbol") or it.get("ticker") or ""
+        name   = it.get("name") or it.get("title") or ""
+        provider = (it.get("provider") or it.get("exchange") or "") or ""
+        # filtrez vizual pe cele relevante
+        line = f"- epic={epic} | symbol={symbol} | name={name} | provider={provider}"
+        info(line)
+        # strâng într-o listă ca să putem folosi ulterior, dacă vrem
+        found.append({"epic": epic, "symbol": symbol, "name": name, "provider": provider})
+    return found
     Capital.com REST:
       POST /api/v1/session
       Headers: X-CAP-API-KEY
