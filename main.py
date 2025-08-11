@@ -15,7 +15,7 @@ def load_env():
     return cfg
 
 CFG = load_env()
-
+API_IDENTIFIER = CFG.get("API_IDENTIFIER", "")  # emailul cu care intri în Capital
 API_KEY        = CFG.get("API_KEY","")
 API_PASSWORD   = CFG.get("API_PASSWORD","")
 SYMBOL         = CFG.get("SYMBOL","ETHUSD").replace("/","")
