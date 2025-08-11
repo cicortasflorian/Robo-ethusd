@@ -1,7 +1,8 @@
+# main.py — ROBO1 (Capital.com compat) — no pandas + debug env lengths
 import time, json, requests
 from datetime import datetime, timedelta, timezone
 
-# ---------- Config din ./env ----------
+# ----------- Config din ./env -----------
 def load_env():
     cfg = {}
     try:
@@ -15,11 +16,24 @@ def load_env():
     return cfg
 
 CFG = load_env()
-API_IDENTIFIER = CFG.get("API_IDENTIFIER", "")  # emailul cu care intri în Capital
-API_KEY        = CFG.get("API_KEY","")
-API_PASSWORD   = CFG.get("API_PASSWORD","")
-SYMBOL         = CFG.get("SYMBOL","ETHUSD").replace("/","")
-TIMEFRAME      = CFG.get("TIMEFRAME","10m")
+
+# Debug: verificăm lungimea valorilor din env
+def _mask(v, full=False):
+    if not v:
+        return ""
+    return v if full else (v[:3] + "***")
+
+for key in ["API_IDENTIFIER", "API_KEY", "API_PASSWORD"]:
+    value = CFG.get(key, "")
+    masked_value = _mask(value, full=(key == "API_IDENTIFIER"))
+    print(f"[DEBUG] {key} length={len(value)} value='{masked_value}'", flush=True)
+
+# Configurări
+API_IDENTIFIER = CFG.get("API_IDENTIFIER", "")  # email-ul de login Capital
+API_KEY        = CFG.get("API_KEY", "")
+API_PASSWORD   = CFG.get("API_PASSWORD", "")
+SYMBOL         = CFG.get("SYMBOL", "ETHUSD").replace("/", "")
+TIMEFRAME      = CFG.get("TIMEFRAME", "10m")
 RSI_PERIOD     = int(CFG.get("RSI_PERIOD", 3))
 INVEST_AMOUNT  = float(CFG.get("INVEST_AMOUNT", 10))
 MAX_SPREAD     = float(CFG.get("MAX_SPREAD_PERCENT", 0.7))
@@ -43,19 +57,26 @@ def api_headers(extra=None):
     if extra: h.update(extra)
     return h
 
+# ---------- Login ----------
 def login_session():
-    """Obține CST & X-SECURITY-TOKEN pe baza API key + custom password."""
+    """Login cu email (API_IDENTIFIER) + parola de cont (API_PASSWORD)."""
     global CST, XSEC
-    payload = {"identifier": API_KEY, "password": API_PASSWORD}
-    r = requests.post(f"{BASE}/api/v1/session", headers=api_headers(),
-                      json=payload, timeout=20)
+    payload = {"identifier": API_IDENTIFIER, "password": API_PASSWORD}
+    r = requests.post(
+        f"{BASE}/api/v1/session",
+        headers=api_headers({"Content-Type": "application/json"}),
+        json=payload,
+        timeout=20
+    )
     if r.status_code >= 400:
         raise RuntimeError(f"Login failed: {r.status_code} {r.text}")
     CST  = r.headers.get("CST")
     XSEC = r.headers.get("X-SECURITY-TOKEN")
     if not CST or not XSEC:
         raise RuntimeError("Missing CST or X-SECURITY-TOKEN after login.")
+    print("[AUTH] Login OK", flush=True)
 
+# ---------- Helpers piețe ----------
 def to_resolution(tf: str) -> str:
     t = tf.strip().lower()
     if t.endswith("m"):
@@ -70,22 +91,27 @@ def resolve_epic(symbol: str) -> str:
     if symbol in EPIC_CACHE: return EPIC_CACHE[symbol]
     for q in ("searchTerm", "search"):
         try:
-            r = requests.get(f"{BASE}/api/v1/markets?{q}={symbol}",
-                             headers=api_headers(), timeout=20)
-            if r.status_code >= 400: continue
+            url = f"{BASE}/api/v1/markets?{q}={symbol}"
+            r = requests.get(url, headers=api_headers(), timeout=20)
+            if r.status_code >= 400: 
+                continue
             js = r.json()
             items = js.get("markets") or js.get("instruments") or js
             if isinstance(items, dict):
                 items = items.get("markets") or items.get("instruments")
-            if not isinstance(items, list): continue
+            if not isinstance(items, list):
+                continue
             for it in items:
                 epic = it.get("epic") or it.get("EPIC") or it.get("id")
-                sym  = (it.get("instrumentName") or it.get("symbol") or "").replace("/","")
+                sym  = (it.get("instrumentName") or it.get("symbol") or "").replace("/", "")
                 if epic and (symbol.upper() in (sym.upper(), epic.upper())):
-                    EPIC_CACHE[symbol] = epic; return epic
+                    EPIC_CACHE[symbol] = epic
+                    return epic
+            # fallback: primul cu "epic"
             for it in items:
                 if "epic" in it:
-                    EPIC_CACHE[symbol] = it["epic"]; return it["epic"]
+                    EPIC_CACHE[symbol] = it["epic"]
+                    return it["epic"]
         except Exception:
             continue
     raise RuntimeError(f"Nu am putut găsi EPIC pentru {symbol}")
@@ -127,18 +153,21 @@ def get_quote(epic: str):
 def pct_spread(ask, bid):
     return ((ask - bid) / bid) * 100 if bid else 999
 
+# ---------- RSI simplu ----------
 def calc_rsi_simple(closes, period):
-    # RSI simplu: folosește ultimele 'period'+1 valori
     if len(closes) < period + 1:
         return None
     gains = 0.0
     losses = 0.0
+    # ultimele 'period' diferențe
     for i in range(-period, 0):
-        diff = closes[i] - closes[i-1]
-        if diff > 0: gains += diff
-        elif diff < 0: losses -= diff
+        diff = closes[i] - closes[i - 1]
+        if diff > 0:
+            gains += diff
+        elif diff < 0:
+            losses -= diff
     avg_gain = gains / period
-    avg_loss = losses / period if losses != 0 else 1e-9
+    avg_loss = (losses / period) if losses != 0 else 1e-9
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
@@ -154,7 +183,7 @@ def tick(epic, res_code):
     global prev_rsi, pozitie, ultima_buy, tranzactii_azi, cumparari_azi, capital_local
     now = datetime.now(timezone.utc)
 
-    closes = get_prices(epic, res_code, max_n=max(200, RSI_PERIOD*5))
+    closes = get_prices(epic, res_code, max_n=max(200, RSI_PERIOD * 5))
     cur_rsi = calc_rsi_simple(closes, RSI_PERIOD)
     if cur_rsi is None:
         return
@@ -162,11 +191,13 @@ def tick(epic, res_code):
     ask, bid = get_quote(epic)
     spread = pct_spread(ask, bid)
 
+    # reset zilnic (UTC ~ la miezul nopții)
     if now.hour == 0 and now.minute < 5 and tranzactii_azi > 0:
-        tranzactii_azi = 0; cumparari_azi = []
+        tranzactii_azi = 0
+        cumparari_azi = []
 
-    crossed_down_buy = prev_rsi is not None and (prev_rsi > BUY_LVL) and (cur_rsi <= BUY_LVL)
-    crossed_up_sell  = prev_rsi is not None and (prev_rsi < SELL_LVL) and (cur_rsi >= SELL_LVL)
+    crossed_down_buy = (prev_rsi is not None) and (prev_rsi > BUY_LVL) and (cur_rsi <= BUY_LVL)
+    crossed_up_sell  = (prev_rsi is not None) and (prev_rsi < SELL_LVL) and (cur_rsi >= SELL_LVL)
 
     # SELL
     if pozitie:
@@ -174,44 +205,48 @@ def tick(epic, res_code):
         delta_pct = ((bid - entry) / entry) * 100
         net_profit = delta_pct - spread
         if delta_pct >= 5 and net_profit >= MIN_NET_PROFIT:
-            print(f"[ROBO1] SELL TAKE +5% | RSI={cur_rsi:.2f} | net={net_profit:.2f}%")
-            pozitie = None; capital_local += INVEST_AMOUNT * (1 + net_profit/100)
+            print(f"[ROBO1] SELL TAKE +5% | RSI={cur_rsi:.2f} | net={net_profit:.2f}%", flush=True)
+            pozitie = None; capital_local += INVEST_AMOUNT * (1 + net_profit / 100)
         elif delta_pct <= -2:
-            print(f"[ROBO1] SELL STOP -2% | RSI={cur_rsi:.2f} | pnl={delta_pct:.2f}%")
-            pozitie = None; capital_local += INVEST_AMOUNT * (1 + delta_pct/100)
+            print(f"[ROBO1] SELL STOP -2% | RSI={cur_rsi:.2f} | pnl={delta_pct:.2f}%", flush=True)
+            pozitie = None; capital_local += INVEST_AMOUNT * (1 + delta_pct / 100)
         elif crossed_up_sell and net_profit >= MIN_NET_PROFIT:
-            print(f"[ROBO1] SELL RSI CROSS-UP {SELL_LVL} | RSI={cur_rsi:.2f} | net={net_profit:.2f}%")
-            pozitie = None; capital_local += INVEST_AMOUNT * (1 + net_profit/100)
+            print(f"[ROBO1] SELL RSI CROSS-UP {SELL_LVL} | RSI={cur_rsi:.2f} | net={net_profit:.2f}%", flush=True)
+            pozitie = None; capital_local += INVEST_AMOUNT * (1 + net_profit / 100)
+    # BUY
     else:
         if tranzactii_azi < 3 and crossed_down_buy and spread <= MAX_SPREAD:
-            ok_cd = (not ultima_buy) or (now - ultima_buy > timedelta(hours=2))                     or (len(cumparari_azi)>0 and ask < cumparari_azi[-1]*0.995)
+            ok_cd = (not ultima_buy) or (now - ultima_buy > timedelta(hours=2)) \
+                    or (len(cumparari_azi) > 0 and ask < cumparari_azi[-1] * 0.995)
             if ok_cd:
                 pozitie = {"pret": ask, "ora": now}
                 ultima_buy = now
                 cumparari_azi.append(ask)
                 tranzactii_azi += 1
                 capital_local -= INVEST_AMOUNT
-                print(f"[ROBO1] BUY RSI CROSS-DOWN {BUY_LVL} | RSI={cur_rsi:.2f} | price={ask:.2f} | spread={spread:.2f}%")
+                print(f"[ROBO1] BUY RSI CROSS-DOWN {BUY_LVL} | RSI={cur_rsi:.2f} | price={ask:.2f} | spread={spread:.2f}%", flush=True)
 
     prev_rsi = cur_rsi
 
 def main():
-    print("[ROBO1] pornit (no-pandas)")
+    print(f"[ROBO1] START | SYMBOL={SYMBOL} TF={TIMEFRAME} RSI={RSI_PERIOD} BUY={BUY_LVL} SELL={SELL_LVL} "
+          f"MAX_SPREAD%={MAX_SPREAD} MIN_NET_PROFIT%={MIN_NET_PROFIT}", flush=True)
+    # 1) Login
     login_session()
+    # 2) EPIC
     epic = resolve_epic(SYMBOL.upper())
     res = to_resolution(TIMEFRAME)
-    print(f"[ROBO1] Config: SYMBOL={SYMBOL} EPIC={epic} RES={res} "
-          f"RSI={RSI_PERIOD} BUY={BUY_LVL} SELL={SELL_LVL} "
-          f"MAX_SPREAD%={MAX_SPREAD} MIN_NET_PROFIT%={MIN_NET_PROFIT}")
+    print(f"[ROBO1] EPIC={epic} RES={res}", flush=True)
+    # 3) Loop
     while True:
         try:
             tick(epic, res)
         except Exception as e:
-            print(f"[ROBO1] Eroare: {e}")
+            print(f"[ROBO1] Eroare: {e}", flush=True)
             try:
                 login_session()
             except Exception as ee:
-                print(f"[ROBO1] Relogin fail: {ee}")
+                print(f"[ROBO1] Relogin fail: {ee}", flush=True)
         time.sleep(60)
 
 if __name__ == "__main__":
