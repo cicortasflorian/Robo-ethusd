@@ -1,9 +1,9 @@
-import time
 import json
+import time
 import requests
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
-# ---------- citire config din ./env ----------
+# ------------ citire config din ./env ------------
 def load_env():
     cfg = {}
     try:
@@ -18,162 +18,138 @@ def load_env():
 
 CFG = load_env()
 
-API_IDENTIFIER      = CFG.get("API_IDENTIFIER", "")   # emailul din Capital.com
-API_KEY             = CFG.get("API_KEY", "")
-API_PASSWORD        = CFG.get("API_PASSWORD", "")
-SYMBOL              = CFG.get("SYMBOL", "ETHUSD").replace("/", "")
-TIMEFRAME           = CFG.get("TIMEFRAME", "10m")
-RSI_PERIOD          = int(CFG.get("RSI_PERIOD", 3))
-INVEST_AMOUNT       = float(CFG.get("INVEST_AMOUNT", 10))
-MAX_SPREAD          = float(CFG.get("MAX_SPREAD_PERCENT", 0.7))
-MIN_NET_PROFIT      = float(CFG.get("MIN_NET_PROFIT_PERCENT", 0.5))
-BUY_LVL             = float(CFG.get("BUY_CROSS_LEVEL", 28))
-SELL_LVL            = float(CFG.get("SELL_CROSS_LEVEL", 72))
+API_IDENTIFIER = CFG.get("API_IDENTIFIER", "")  # emailul de login Capital
+API_KEY        = CFG.get("API_KEY", "")
+API_PASSWORD   = CFG.get("API_PASSWORD", "")
+SYMBOL         = (CFG.get("SYMBOL", "ETHUSD") or "ETHUSD").replace("/", "")
 
 BASE = "https://api-capital.backend-capital.com"
 
-# tokenurile de sesiune
 CST  = None
 XSEC = None
 
-# ---------- utilitare ----------
+# ------------ utilitare log ------------
 def now():
-    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-def mask(s: str, keep: int = 3) -> str:
+def info(msg):
+    print(f"{now()} [ROBO1] {msg}", flush=True)
+
+def dbg(msg):
+    print(f"{now()} [DEBUG] {msg}", flush=True)
+
+def mask(s, keep=3):
     if not s:
         return ""
     if len(s) <= keep:
         return "*" * len(s)
     return s[:keep] + "*" * max(0, len(s) - keep)
 
-def dbg(msg: str):
-    print(f"{now()} [DEBUG] {msg}", flush=True)
+# ------------ apeluri HTTP ------------
+def get_json(url, params=None, retries=3, sleep_s=0.8):
+    """GET cu token-urile de sesiune şi retry simplu."""
+    global CST, XSEC
+    headers = {
+        "Accept": "application/json",
+        "X-SECURITY-TOKEN": XSEC or "",
+        "CST": CST or "",
+    }
+    last_text = ""
+    for i in range(1, retries + 1):
+        r = requests.get(url, headers=headers, params=params, timeout=20)
+        if r.status_code == 200:
+            return r.json()
+        last_text = r.text
+        time.sleep(sleep_s)
+    raise RuntimeError(f"GET {url} a eşuat după {retries} încercări: "
+                       f"{r.status_code} {last_text}")
 
-def info(msg: str):
-    print(f"{now()} [ROBO1] {msg}", flush=True)
+def post_json(url, payload, headers=None):
+    h = {
+        "Content-Type": "application/json; charset=UTF-8",
+        "Accept": "application/json",
+    }
+    if headers:
+        h.update(headers)
+    r = requests.post(url, data=json.dumps(payload), headers=h, timeout=20)
+    return r
 
-# ---------- request helper cu retry ----------
-def get_json(url, headers=None, params=None, retries=3, timeout=20):
-    last = None
-    for i in range(retries):
-        r = requests.get(url, headers=headers, params=params, timeout=timeout)
-        if r.ok:
-            try:
-                return r.json()
-            except Exception:
-                raise RuntimeError(f"JSON invalid de la {url}: {r.text[:500]}")
-        last = (r.status_code, r.text)
-        time.sleep(1 + i)
-    code, txt = last or ("n/a", "")
-    raise RuntimeError(f"GET {url} a eșuat după {retries} încercări: {code} {txt}")
-
-# ---------- sesiune login ----------
+# ------------ login ------------
 def login_session():
     """
     Capital.com REST:
       POST /api/v1/session
-      Headers: X-CAP-API-KEY
-      Body: { "identifier": <email>, "password": <api_password>, "type": "password" }
-      Răspuns: headers CST și X-SECURITY-TOKEN
+      Headers:  X-CAP-API-KEY
+      Body:     {"identifier": <email>, "password": <api_password>, "type":"password"}
+      Răspuns:  headere CST + X-SECURITY-TOKEN
     """
     global CST, XSEC
 
-    # log lungimi/valori mascate pentru debug (fără să scăpăm secretele)
+    # log lungimi (valorile sunt mascate)
     dbg(f"API_IDENTIFIER length={len(API_IDENTIFIER)} value='{API_IDENTIFIER}'")
     dbg(f"API_KEY length={len(API_KEY)} value='{mask(API_KEY)}'")
     dbg(f"API_PASSWORD length={len(API_PASSWORD)} value='{mask(API_PASSWORD)}'")
 
     url = f"{BASE}/api/v1/session"
-    headers = {
-        "Content-Type": "application/json",
-        "X-CAP-API-KEY": API_KEY,
-    }
+    headers = {"X-CAP-API-KEY": API_KEY}
     payload = {
         "identifier": API_IDENTIFIER,
         "password": API_PASSWORD,
-        "type": "password"
+        "type": "password",
     }
-    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=25)
+
+    r = post_json(url, payload, headers=headers)
     if r.status_code != 200:
+        # arătăm textul brut ca să vedem codul de eroare de la Capital
         raise RuntimeError(f"Login failed: {r.status_code} {r.text}")
 
     CST  = r.headers.get("CST")
     XSEC = r.headers.get("X-SECURITY-TOKEN")
 
     if not CST or not XSEC:
-        raise RuntimeError("Tokenele de sesiune lipsesc (CST/X-SECURITY-TOKEN).")
+        raise RuntimeError("Login OK, dar lipsesc headerele CST/X-SECURITY-TOKEN")
 
-    dbg(f"Sesiune OK | CST len={len(CST)}, XSEC len={len(XSEC)}")
+    info("Login OK (CST & X-SECURITY-TOKEN setate).")
 
-def auth_headers():
-    if not CST or not XSEC:
-        raise RuntimeError("Nu există sesiune activă. Apelează login_session() mai întâi.")
-    return {
-        "X-CAP-API-KEY": API_KEY,
-        "CST": CST,
-        "X-SECURITY-TOKEN": XSEC,
-    }
-
-# ---------- căutare instrumente (endpoint corect /markets) ----------
-def search_symbols(q: str):
+# ------------ căutare EPIC pentru ETHUSD ------------
+def get_ethusd_epic():
     """
-    Folosește /api/v1/markets?search=<q>
-    Răspunsul conține o listă sub cheia 'markets'.
-    Fiecare element are câmpuri precum: 'epic', 'symbol', 'instrumentName', 'provider', etc.
+    Foloseşte endpointul corect /api/v1/instruments cu param 'search'.
+    Filtrăm după symbol exact 'ETHUSD' şi luăm primul EPIC.
     """
-    url = f"{BASE}/api/v1/markets"
-    data = get_json(url, headers=auth_headers(), params={"search": q})
-    markets = data.get("markets", []) if isinstance(data, dict) else []
-    results = []
-    for m in markets:
-        results.append({
-            "epic": m.get("epic"),
-            "symbol": (m.get("symbol") or "").upper(),
-            "name": m.get("instrumentName") or m.get("name") or "",
-            "provider": m.get("provider") or "",
-        })
-    # log primele rezultate pentru debug
-    for item in results[:30]:
-        info(f"- epic={item['epic']} | symbol={item['symbol']} | name={item['name']} | provider={item['provider']}")
-    return results
+    url = f"{BASE}/api/v1/instruments"
+    data = get_json(url, params={"search": SYMBOL})
 
-def get_epic(symbol: str) -> str:
-    """
-    Găsește EPIC pentru un 'symbol' (ex: 'ETHUSD').
-    - caută direct după symbol exact (case-insensitive)
-    - altfel încearcă match-uri parțiale
-    - dacă nu găsește, ridică o eroare clară
-    """
-    s = (symbol or "").upper()
-    if not s:
-        raise RuntimeError("Symbol gol.")
+    # răspunsul e o listă de instrumente; căutăm symbol == ETHUSD
+    for it in data:
+        try:
+            symbol = (it.get("symbol") or "").replace("/", "")
+            if symbol == "ETHUSD":
+                epic = it.get("epic") or ""
+                name = it.get("name") or ""
+                dbg(f"match: epic={epic} | symbol={symbol} | name={name}")
+                if epic:
+                    return epic
+        except Exception:
+            continue
 
-    markets = search_symbols(s)
-    # match exact pe symbol
-    for m in markets:
-        if (m.get("symbol") or "").upper() == s:
-            return m.get("epic")
+    # dacă nu am găsit, arătăm câteva prime intrări pentru debug
+    sample = data[:3] if isinstance(data, list) else data
+    raise RuntimeError(f"EPIC pentru ETHUSD nu a fost găsit. Mostră răspuns: {sample}")
 
-    # fallback: prima intrare care conține symbol în name/symbol
-    for m in markets:
-        name = (m.get("name") or "").upper()
-        sym  = (m.get("symbol") or "").upper()
-        if s in sym or s in name:
-            return m.get("epic")
-
-    raise RuntimeError(f"EPIC not found for {symbol}")
-
-# ---------- punctul de intrare ----------
+# ------------ main ------------
 def main():
-    info(f"START | SYMBOL={SYMBOL} TF={TIMEFRAME} RSI={RSI_PERIOD} "
-         f"BUY={BUY_LVL} SELL={SELL_LVL} MAX_SPREAD%={MAX_SPREAD} MIN_NET_PROFIT%={MIN_NET_PROFIT}")
+    info(f"START | SYMBOL={SYMBOL}")
+
     login_session()
-    epic = get_epic(SYMBOL)
-    info(f"FOUND EPIC '{epic}' pentru SYMBOL '{SYMBOL}'")
-    # aici poți continua cu restul pașilor (quotes, RSI, ordine etc.)
-    # momentan oprim după validarea EPIC-ului
-    return
+
+    epic = get_ethusd_epic()
+    info(f"EPIC pentru ETHUSD: {epic}")
+
+    # aici poţi continua cu logica de preţuri / plasare ordine, folosind EPIC-ul
+    # momentan doar dormim in buclă ca să ţinem workerul viu
+    while True:
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()
