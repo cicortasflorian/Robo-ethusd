@@ -1,30 +1,7 @@
-# main.py
-import time
-import json
-import requests
+import time, json, requests
 from datetime import datetime, timezone
 
-# ------------- utilitare -------------
-BASE = "https://api-capital.backend-capital.com"
-
-def now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-def mask(s, keep=3):
-    if not s:
-        return ""
-    s = str(s)
-    if len(s) <= keep:
-        return "*" * len(s)
-    return s[:keep] + "*" * max(0, len(s) - keep)
-
-def dbg(msg):
-    print(f"{now()} [DEBUG] {msg}", flush=True)
-
-def info(msg):
-    print(f"{now()} [ROBO]  {msg}", flush=True)
-
-# ------------- Config din ./env -------------
+# ---------- Config din ./env ----------
 def load_env():
     cfg = {}
     try:
@@ -39,51 +16,76 @@ def load_env():
 
 CFG = load_env()
 
-# chei de interes (poți adăuga altele în env fără să umbli în cod)
-API_IDENTIFIER   = CFG.get("API_IDENTIFIER", "")   # emailul cu care intri în Capital
-API_KEY          = CFG.get("API_KEY", "")
-API_PASSWORD     = CFG.get("API_PASSWORD", "")
-SYMBOL           = CFG.get("SYMBOL", "ETHUSD")
-PROVIDER_FILTER  = CFG.get("PROVIDER", "").strip()      # opțional (ex. "Capital.com" sau "CAPITALCOMSB")
-DIRECT_EPIC      = CFG.get("DIRECT_EPIC", "").strip()   # dacă îl știi, sari căutarea
-# restul parametrilor de strategie rămân în env (nu ne trebuie aici pentru login/căutare)
+API_IDENTIFIER      = CFG.get("API_IDENTIFIER", "")   # emailul cu care intri în Capital
+API_KEY             = CFG.get("API_KEY", "")
+API_PASSWORD        = CFG.get("API_PASSWORD", "")
+SYMBOL              = CFG.get("SYMBOL", "ETHUSD").replace("/", "")
+TIMEFRAME           = CFG.get("TIMEFRAME", "10m")
+RSI_PERIOD          = int(CFG.get("RSI_PERIOD", 3))
+INVEST_AMOUNT       = float(CFG.get("INVEST_AMOUNT", 10))
+MAX_SPREAD          = float(CFG.get("MAX_SPREAD_PERCENT", 0.7))
+MIN_NET_PROFIT      = float(CFG.get("MIN_NET_PROFIT_PERCENT", 0.5))
+BUY_LVL             = float(CFG.get("BUY_CROSS_LEVEL", 28))
+SELL_LVL            = float(CFG.get("SELL_CROSS_LEVEL", 72))
 
-info(f"START | SYMBOL={SYMBOL}")
+BASE = "https://api-capital.backend-capital.com"
 
 CST = None
 XSEC = None
 
-# ------------- HTTP helper cu retry -------------
-def get_json(url, method="GET", headers=None, params=None, data=None, retries=3, sleep_s=1):
+# ---------- util ----------
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+def mask(s, keep=3):
+    if not s:
+        return ""
+    if len(s) <= keep:
+        return "*" * len(s)
+    return s[:keep] + "*" * max(0, len(s) - keep)
+
+def dbg(msg):
+    print(f"{now()} [DEBUG] {msg}", flush=True)
+
+def info(msg):
+    print(f"{now()} [ROBO] {msg}", flush=True)
+
+# ---------- HTTP helpers ----------
+def auth_headers(extra=None):
+    h = {
+        "Content-Type": "application/json; charset=UTF-8",
+        "Accept": "application/json",
+        "X-CAP-API-KEY": API_KEY,
+    }
+    if CST:
+        h["CST"] = CST
+    if XSEC:
+        h["X-SECURITY-TOKEN"] = XSEC
+    if extra:
+        h.update(extra)
+    return h
+
+def get_json(url, params=None, retries=3, sleep_s=1.0):
+    last_text = ""
     for i in range(1, retries + 1):
-        try:
-            if method == "GET":
-                r = requests.get(url, headers=headers, params=params, timeout=20)
-            else:
-                r = requests.post(url, headers=headers, data=data, timeout=20)
-
-            if r.status_code == 200:
-                if r.text.strip() == "":
-                    return None
+        r = requests.get(url, headers=auth_headers(), params=params, timeout=20)
+        if r.ok:
+            try:
                 return r.json()
-            else:
-                last_text = r.text
-                dbg(f"HTTP {r.status_code} for {url} | try {i}/{retries}")
-        except Exception as e:
-            last_text = str(e)
-            dbg(f"Exception for {url} | try {i}/{retries}: {e}")
-
+            except Exception:
+                return json.loads(r.text or "{}")
+        last_text = r.text
+        dbg(f"HTTP {r.status_code} for {url} | try {i}/{retries}")
         time.sleep(sleep_s)
-
     raise RuntimeError(f"GET {url} a eșuat după {retries} încercări: {last_text}")
 
-# ------------- sesiune login -------------
+# ---------- sesiune login ----------
 def login_session():
     """
     Capital.com REST:
       POST /api/v1/session
       Headers: X-CAP-API-KEY
-      Body: { "identifier": <email>, "password": <pass>, "type": "password" }
+      Body: { "identifier": <email>, "password": <pwd>, "type": "password" }
       Răspuns: headers CST și X-SECURITY-TOKEN
     """
     global CST, XSEC
@@ -95,8 +97,8 @@ def login_session():
 
     url = f"{BASE}/api/v1/session"
     headers = {
-        "Content-Type": "application/json",
-        "X-CAP-API-KEY": API_KEY,
+        "Content-Type": "application/json; charset=UTF-8",
+        "X-CAP-API-KEY": API_KEY
     }
     payload = {
         "identifier": API_IDENTIFIER,
@@ -104,126 +106,83 @@ def login_session():
         "type": "password"
     }
 
-    # nu folosim get_json aici ca să putem inspecta header-ele răspunsului
-    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=25)
-
-    dbg(f"login response status={r.status_code}")
-    dbg(f"login response text={r.text}")
-
-    if r.status_code != 200:
+    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
+    if not r.ok:
         raise RuntimeError(f"Login failed: {r.status_code} {r.text}")
 
-    # header-ele critice
-    CST = r.headers.get("CST") or r.headers.get("cst")
-    XSEC = r.headers.get("X-SECURITY-TOKEN") or r.headers.get("x-security-token")
+    CST  = r.headers.get("CST")
+    XSEC = r.headers.get("X-SECURITY-TOKEN")
+    dbg(f"CST='{mask(CST, keep=2)}' | X-SECURITY-TOKEN='{mask(XSEC, keep=2)}'")
 
-    dbg(f"CST='{mask(CST)}' | X-SECURITY-TOKEN='{mask(XSEC)}'")
+    # opțional: info despre cont, util pt. confirmare
+    try:
+        me = get_json(f"{BASE}/api/v1/accounts")
+        print(json.dumps(me, ensure_ascii=False))
+    except Exception as e:
+        dbg(f"accounts error: {e}")
 
     if not CST or not XSEC:
-        raise RuntimeError("Login OK, dar lipsesc CST sau X-SECURITY-TOKEN")
+        raise RuntimeError("Login OK, dar lipsesc token-urile (CST/X-SECURITY-TOKEN)")
+
     info("Login OK (CST & X-SECURITY-TOKEN)")
 
-def auth_headers():
-    """Headerele pentru apeluri după login."""
-    return {
-        "Content-Type": "application/json",
-        "X-CAP-API-KEY": API_KEY,
-        "CST": CST,
-        "X-SECURITY-TOKEN": XSEC,
-    }
-
-# ------------- căutare EPIC -------------
-def normalize_symbol(s: str) -> str:
-    if not s:
-        return ""
-    s = s.upper().replace(" ", "")
-    # normalizează variante comune
-    s = s.replace("/", "").replace("-", "")
-    return s
-
-def candidate_queries(sym: str):
-    base = sym.strip()
-    yield base
-    # câteva variații utile
-    yield base.replace("/", "")
-    yield base.replace("-", "")
-    yield base.replace(" ", "")
-    if base.upper() == "ETHUSD":
-        # câteva alternative posibile
-        for alt in ["ETH/USD", "ETH US D", "ETH-USD", "ETHUSD", "ETH W USD", "ETHWUSD", "ETH W/USD", "Ethereum USD", "Ethereum / USD"]:
-            yield alt
-
-def find_epic(symbol: str):
+# ---------- căutare EPIC pentru SYMBOL ----------
+def get_ethusd_epic():
     """
-    Caută EPIC pentru simbolul dat folosind /api/v1/instruments?search=...
-    Încearcă câteva variante și filtrează providerul dacă e setat.
-    Dacă DIRECT_EPIC e în env, îl returnează direct.
+    Caută EPIC pentru SYMBOL folosind /instruments.
+    Dacă 404, încearcă /instruments/ și apoi /symbols.
     """
-    if DIRECT_EPIC:
-        info(f"Folosesc DIRECT_EPIC din .env: {DIRECT_EPIC}")
-        return DIRECT_EPIC
+    urls = [
+        f"{BASE}/api/v1/instruments",
+        f"{BASE}/api/v1/instruments/",
+        f"{BASE}/api/v1/symbols",
+    ]
+    data = None
+    last_err = None
+    dbg(f"Caut '{SYMBOL}' în /instruments …")
 
-    url = f"{BASE}/api/v1/instruments"
-    wanted_norm = normalize_symbol(symbol)
-
-    headers = auth_headers()
-
-    for q in candidate_queries(symbol):
-        info(f"Caut '{q}' în /instruments …")
-        data = get_json(url, headers=headers, params={"search": q}, retries=3, sleep_s=1)
-
-        if not isinstance(data, list):
-            dbg(f"Răspuns neașteptat (nu e listă).")
+    for u in urls:
+        try:
+            data = get_json(u, params={"search": SYMBOL})
+            break
+        except RuntimeError as e:
+            last_err = e
             continue
 
-        # log câteva rezultate pentru debug
-        preview = data[:10]
-        for it in preview:
-            sym = it.get("symbol")
-            epic = it.get("epic")
-            name = it.get("name")
-            prov = it.get("provider")
-            dbg(f"- epic={epic} | symbol={sym} | name={name} | provider={prov}")
+    if data is None:
+        raise last_err
 
-        # întâi încercăm potrivire strictă pe symbol normalizat
-        for it in data:
-            sym = normalize_symbol(it.get("symbol"))
-            prov = (it.get("provider") or "").strip()
-            if sym == wanted_norm and (not PROVIDER_FILTER or prov == PROVIDER_FILTER):
-                epic = it.get("epic")
+    # răspunsul e o listă; găsim exact SYMBOL
+    for it in data:
+        try:
+            symbol = it.get("symbol")
+            if symbol == SYMBOL:
+                epic = it.get("epic") or it.get("id")
+                name = it.get("name") or ""
+                dbg(f"match: epic={epic} | symbol={symbol} | name={name}")
                 if epic:
-                    info(f"Match strict: symbol={it.get('symbol')} | provider={prov} | epic={epic}")
                     return epic
+        except Exception:
+            continue
 
-        # apoi încercăm potrivire lejeră (conține ETH + USD)
-        for it in data:
-            sym_raw = it.get("symbol") or ""
-            sym = normalize_symbol(sym_raw)
-            prov = (it.get("provider") or "").strip()
-            if "ETH" in sym and "USD" in sym and (not PROVIDER_FILTER or prov == PROVIDER_FILTER):
-                epic = it.get("epic")
-                if epic:
-                    info(f"Match lejer: symbol={sym_raw} | provider={prov} | epic={epic}")
-                    return epic
+    # dacă nu am găsit, arătăm câteva prime elemente ca diagnostic
+    sample = data[:3] if isinstance(data, list) else data
+    raise RuntimeError(f"EPIC pentru {SYMBOL} nu a fost găsit. Sample: {sample}")
 
-    # dacă nu am găsit, ridicăm eroare și arătăm un eșantion
-    raise RuntimeError(f"EPIC pentru {symbol} nu a fost găsit după mai multe încercări.")
-
-# ------------- main -------------
+# ---------- main ----------
 def main():
+    info(f"START | SYMBOL={SYMBOL} | TF={TIMEFRAME} RSI={RSI_PERIOD} "
+         f"BUY={BUY_LVL} SELL={SELL_LVL} MAX_SPREAD%={MAX_SPREAD} MIN_NET_PROFIT%={MIN_NET_PROFIT}")
+
     login_session()
 
-    try:
-        epic = find_epic(SYMBOL)
-        info(f"EPIC găsit pentru {SYMBOL}: {epic}")
-        # aici, dacă vrei, continui cu strategia/orderele pe 'epic'
-        # deocamdată doar dormim ca să păstrăm workerul viu
-        while True:
-            time.sleep(30)
-    except RuntimeError as e:
-        info(str(e))
-        # Nu oprim imediat; doar așteptăm ca să poți vedea logurile
-        time.sleep(120)
+    epic = get_ethusd_epic()
+    info(f"EPIC găsit pentru {SYMBOL}: {epic}")
+
+    # Aici ai deja EPIC-ul. Poți continua cu restul strategiei/fluxului tău.
+    # Pentru moment, doar dormim ca workerul să rămână „Live”.
+    while True:
+        time.sleep(60)
 
 if __name__ == "__main__":
-    main()
+    main()    
